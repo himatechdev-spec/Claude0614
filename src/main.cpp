@@ -5,6 +5,9 @@
 #include <atomic>
 #include <chrono>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
 #include <iostream>
 #include <cerrno>
 #include <cstring>
@@ -57,9 +60,64 @@ static bool applyRealtimeScheduling() {
     return true;
 }
 
-// ---- RS485 state ----------------------------------------------------
+// ---- RS485 worker thread --------------------------------------------
+// The RT control loop enqueues write requests here; a separate low-priority
+// thread drains the queue so RS485 I/O never blocks the control loop.
+
+struct RS485Request {
+    uint8_t  slave;
+    uint16_t reg;
+    uint16_t value;
+};
+
+static constexpr size_t RS485_QUEUE_MAX = 16;  // drop oldest if overrun
+
+static std::queue<RS485Request> s_rs485_queue;
+static std::mutex               s_rs485_mutex;
+static std::condition_variable  s_rs485_cv;
+static std::thread              s_rs485_thread;
+static std::atomic<bool>        s_rs485_stop{false};
+
 static bool     s_rs485_ok = false;
 static uint16_t s_rs485_i  = 1;   // incrementing value sent to slave
+
+// Called from the worker thread — never from the RT loop.
+static void rs485Worker() {
+    // Low priority: SCHED_OTHER with nice +10, not real-time.
+    struct sched_param sp{};
+    pthread_setschedparam(pthread_self(), SCHED_OTHER, &sp);
+
+    while (true) {
+        RS485Request req{};
+        {
+            std::unique_lock<std::mutex> lk(s_rs485_mutex);
+            s_rs485_cv.wait(lk, [] {
+                return s_rs485_stop.load() || !s_rs485_queue.empty();
+            });
+            if (s_rs485_stop && s_rs485_queue.empty()) break;
+            req = s_rs485_queue.front();
+            s_rs485_queue.pop();
+        }
+
+        auto r = RS485::writeRegister(req.slave, req.reg, req.value);
+        std::cout << "[rs485] writeRegister(slave=" << (int)req.slave
+                  << ", reg=" << req.reg
+                  << ", val=" << req.value
+                  << ")  →  " << (r.ok ? "OK" : "FAIL") << "\n";
+    }
+}
+
+// Called from the RT control loop — non-blocking.
+// Returns false and drops the request if the queue is at capacity.
+static bool enqueueRS485(uint8_t slave, uint16_t reg, uint16_t value) {
+    {
+        std::lock_guard<std::mutex> lk(s_rs485_mutex);
+        if (s_rs485_queue.size() >= RS485_QUEUE_MAX) return false;
+        s_rs485_queue.push({slave, reg, value});
+    }
+    s_rs485_cv.notify_one();
+    return true;
+}
 
 // ---- Peripheral init ------------------------------------------------
 static bool initPeripherals() {
@@ -77,17 +135,31 @@ static bool initPeripherals() {
     // RS485 — /dev/ttyAMA0 requires 'dtoverlay=disable-bt' in config.txt.
     // Non-fatal: heartbeat and E-stop still work if RS485 is unavailable.
     s_rs485_ok = RS485::begin("/dev/ttyAMA0", 9600, /*dePin=*/4);
-    if (s_rs485_ok)
+    if (s_rs485_ok) {
+        s_rs485_stop = false;
+        s_rs485_thread = std::thread(rs485Worker);
         std::cout << "[cook] RS485 ready  (/dev/ttyAMA0, 9600 baud, DE=BCM4)\n";
-    else
+    } else {
         std::cerr << "[cook] RS485 unavailable — check dtoverlay=disable-bt and BCM4 wiring\n";
+    }
 
     return true;
 }
 
 static void cleanupPeripherals() {
     GPIO::write(PIN_STATUS_LED, PinLevel::Low);
-    if (s_rs485_ok) RS485::end();
+
+    if (s_rs485_ok) {
+        // Signal worker to drain remaining queue then exit.
+        {
+            std::lock_guard<std::mutex> lk(s_rs485_mutex);
+            s_rs485_stop = true;
+        }
+        s_rs485_cv.notify_one();
+        if (s_rs485_thread.joinable()) s_rs485_thread.join();
+        RS485::end();
+    }
+
     GPIO::cleanup();
 }
 
@@ -152,14 +224,10 @@ static void controlLoop() {
                       << "  estop=" << (estop ? "ACTIVE" : "OK") << "\n";
             jitter_max = 0;   // reset window
 
-            // Write incrementing value to slave 1, register 10.
-            // Note: the RS485 transaction (~20 ms at 9600 baud) runs here
-            // in-loop; sleep_until() absorbs the overrun on the next iteration.
+            // Hand the write off to the RS485 worker thread — non-blocking.
             if (s_rs485_ok) {
-                auto r = RS485::writeRegister(1, 10, s_rs485_i);
-                std::cout << "[cook] RS485 writeRegister(slave=1, reg=10, val="
-                          << s_rs485_i << ")  →  "
-                          << (r.ok ? "OK" : "FAIL") << "\n";
+                if (!enqueueRS485(1, 10, s_rs485_i))
+                    std::cout << "[cook] RS485 queue full — request dropped\n";
                 ++s_rs485_i;
             }
         }
