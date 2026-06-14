@@ -57,6 +57,10 @@ static bool applyRealtimeScheduling() {
     return true;
 }
 
+// ---- RS485 state ----------------------------------------------------
+static bool     s_rs485_ok = false;
+static uint16_t s_rs485_i  = 1;   // incrementing value sent to slave
+
 // ---- Peripheral init ------------------------------------------------
 static bool initPeripherals() {
     if (!GPIO::init()) {
@@ -70,11 +74,20 @@ static bool initPeripherals() {
     GPIO::setMode(PIN_ESTOP, PinMode::Input);
     GPIO::setPull(PIN_ESTOP, PullMode::Up);
 
+    // RS485 — /dev/ttyAMA0 requires 'dtoverlay=disable-bt' in config.txt.
+    // Non-fatal: heartbeat and E-stop still work if RS485 is unavailable.
+    s_rs485_ok = RS485::begin("/dev/ttyAMA0", 9600, /*dePin=*/4);
+    if (s_rs485_ok)
+        std::cout << "[cook] RS485 ready  (/dev/ttyAMA0, 9600 baud, DE=BCM4)\n";
+    else
+        std::cerr << "[cook] RS485 unavailable — check dtoverlay=disable-bt and BCM4 wiring\n";
+
     return true;
 }
 
 static void cleanupPeripherals() {
     GPIO::write(PIN_STATUS_LED, PinLevel::Low);
+    if (s_rs485_ok) RS485::end();
     GPIO::cleanup();
 }
 
@@ -132,12 +145,23 @@ static void controlLoop() {
             estop_prev = estop;
         }
 
-        // --- Periodic status report ---
+        // --- Periodic status report + RS485 write (every 5 s) ---
         if (loop % REPORT_EVERY == 0) {
             std::cout << "[cook] loop=" << loop
                       << "  jitter_max=" << jitter_max << "µs"
                       << "  estop=" << (estop ? "ACTIVE" : "OK") << "\n";
             jitter_max = 0;   // reset window
+
+            // Write incrementing value to slave 1, register 10.
+            // Note: the RS485 transaction (~20 ms at 9600 baud) runs here
+            // in-loop; sleep_until() absorbs the overrun on the next iteration.
+            if (s_rs485_ok) {
+                auto r = RS485::writeRegister(1, 10, s_rs485_i);
+                std::cout << "[cook] RS485 writeRegister(slave=1, reg=10, val="
+                          << s_rs485_i << ")  →  "
+                          << (r.ok ? "OK" : "FAIL") << "\n";
+                ++s_rs485_i;
+            }
         }
 
         // TODO: add control logic here
