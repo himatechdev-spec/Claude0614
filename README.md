@@ -6,7 +6,7 @@ Cross-compiled on macOS via Docker; deployed over SSH with atomic swap and auto-
 ## Features
 
 - **PREEMPT_RT** kernel, SCHED_FIFO/90 on isolated core 3 — deterministic 10 ms control loop
-- **RS485 Modbus RTU** master over `/dev/ttyAMA0` with DE/RE direction control (BCM4)
+- **RS485 Modbus RTU** master over `/dev/ttyAMA0` with DE/RE direction control (BCM4) and 3-attempt retry
 - **GPIO, I2C, SPI, PWM, UART** peripheral drivers
 - **Systemd service** with OOM protection, restart-on-failure, and CPU affinity enforcement
 - **Docker cross-compilation** — no build tools required on the Pi
@@ -116,6 +116,25 @@ Pi's PL011 UART, `tcdrain()` blocks until the last stop bit has left the
 shift register.  Dropping DE immediately after minimises the window during
 which the Pi's driver holds the bus HIGH while a slave begins its response,
 preventing bus contention.
+
+**Retry behaviour**
+
+All Modbus functions (`readCoils`, `writeRegister`, etc.) attempt each
+transaction up to **3 times** before returning failure.  Retries occur on
+transport errors — Timeout (0xE0), CRCMismatch (0xE1), FrameError (0xE2) —
+which can result from brief bus noise, a slow simulator, or a periodic
+broadcast from another device landing in the response window.  Modbus slave
+exception codes (0x01–0x08) are returned immediately without retry because
+the slave received and definitively rejected the request.
+
+`sendRaw()` flushes the UART RX buffer at the start of every attempt, so
+residual bytes from a corrupted previous response are cleared before the
+retry frame is transmitted.
+
+> **Simulator note:** if a Modbus simulator tool has a "periodic send" or
+> "auto-poll" feature enabled, its transmissions can land in the Pi's response
+> read window and trigger CRC mismatches.  Disable any such feature in the
+> simulator, or rely on the retry logic to absorb the occasional collision.
 
 ## Project layout
 
